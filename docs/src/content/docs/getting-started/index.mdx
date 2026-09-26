@@ -1,0 +1,124 @@
+---
+title: Getting Started
+description: Quick setup guide for UC Local APEX Dev environment
+sidebar:
+  order: 1
+---
+
+import { Aside, Steps } from "@astrojs/starlight/components";
+
+This guide installs an Oracle 26ai database with APEX and ORDS on your machine.
+
+## Before you start
+
+Install these programs first:
+
+- **Docker or Podman** — the scripts support both. They use `docker` when both are installed. On macOS, [read the Podman setup guide](/products/uc-local-apex-dev/docs/other/podman-on-mac).
+- **Compose** — the `docker compose` or `podman compose` subcommand. The standalone `docker-compose` and `podman-compose` tools do not work.
+- **SQLcl** with the `sql` command in your `PATH`. SQLcl needs a working Java runtime.
+- **`unzip`**, and **`curl`** or **`wget`**.
+- A **bash-compatible shell**.
+
+<Aside type="caution" title="Resource Requirements">
+Make sure that the virtual machine has enough resources. **The default Podman VM is too small for Oracle.**
+
+Minimum values:
+
+- **4GB RAM**
+- **3 CPUs**
+- **35GB disk space**
+
+The database image needs about 9GB. The data directory grows to about 6GB. 14GB of free disk space is not enough.
+
+[Read more about the requirements of Oracle containers](https://hartenfeller.dev/blog/containerized-oracle-db-wont-start/)
+
+</Aside>
+
+On **Windows**, use WSL2 (Windows Subsystem for Linux). Oracle containers run better there than on native Windows. Then install everything above inside WSL2. These guides show the steps: [Install Ubuntu on WSL2](https://documentation.ubuntu.com/wsl/latest/howto/install-ubuntu-wsl2/), [Install docker in Ubuntu](https://docs.docker.com/engine/install/ubuntu/), and [Install SQLcl in Linux](https://pacesettergraam.wordpress.com/2025/02/21/installing-sqlcl-in-ubuntu-linux-on-oci/).
+
+## Install
+
+<Steps>
+
+1. **Clone the repository**
+
+   ```bash
+   git clone https://github.com/United-Codes/uc-local-apex-dev.git
+   cd uc-local-apex-dev
+   ```
+
+2. **Run the installer**
+
+   ```bash
+   ./install.sh
+   ```
+
+   The installer asks no questions. It generates an `.env` file with a random SYS password, pulls the images, and starts the containers. Then it installs APEX with the defaults for development and configures ORDS.
+
+   The installer needs 20 to 40 minutes. Most of that time is the download of the Oracle database image. At the end it shows a `=== Done ===` banner.
+
+   If the shell reports `Permission denied`, then run:
+
+   ```bash
+   chmod +x ./install.sh ./local-26ai.sh ./setup.sh ./scripts/*.sh
+   ```
+
+   To read what each step does, or to select a container engine, read [Installation Details](/products/uc-local-apex-dev/docs/getting-started/installation-details/).
+
+3. **Log into APEX**
+
+   Open [http://localhost:8181/ords/apex](http://localhost:8181/ords/apex). Log in to the `INTERNAL` workspace with the user `ADMIN`. The password is the `ORACLE_PASSWORD` value from the generated `.env` file.
+
+4. **Create your first workspace**
+
+   ```bash
+   ./local-26ai.sh create-user myproject
+   ```
+
+   This command creates a database schema and an APEX workspace. It also adds the new user to SQLcl and to VS Code.
+
+   Log in to the new workspace with the user `ADMIN` and the password `Welcome_1`. This is a different password from the `INTERNAL` workspace. Read [Creating Users](/products/uc-local-apex-dev/docs/getting-started/creating-users/) for the options.
+
+</Steps>
+
+## Access your environment
+
+- **APEX**: http://localhost:8181/ords/apex
+- **ORDS Landing**: http://localhost:8181/ords/\_/landing
+- **Database**: localhost:1521 (Service: FREEPDB1)
+
+### Default APEX credentials
+
+- **INTERNAL workspace**: `ADMIN` / value of `ORACLE_PASSWORD` in `.env`
+- **Your own workspaces** (created with `create-user`): `ADMIN` or the schema name / `Welcome_1` (or the value of `ORACLE_PASSWORD` when `WORKSPACE_USE_INTERNAL_PASSWORD=true` in `.env`)
+
+The password of the database schema is not the APEX password. It is the generated `<NAME>_USER_PASSWORD` value in `.env`.
+
+## Next steps
+
+### Run the commands from any directory
+
+The `local-26ai.sh` wrapper gives you every feature of this project. To run it from
+any directory, add the repository to your `PATH`:
+
+```bash
+# Add to ~/.zshrc or ~/.bashrc
+export PATH="/Users/username/path/to/uc-local-apex-dev:$PATH"
+```
+
+### Useful commands
+
+Run `local-26ai.sh --help` for the full list. These commands are the most useful ones
+for a new environment:
+
+- `local-26ai.sh stop` and `local-26ai.sh start`: shut the database down cleanly, then start it again.
+- `local-26ai.sh backup-all`: export every schema, APEX workspace, application, and ORDS module to `./backups/export`. Read [Backups](/products/uc-local-apex-dev/docs/getting-started/backups/).
+- `local-26ai.sh test-app-install app.sql`: install an APEX application export into a clean test schema, and show the invalid objects. Read [Install Apps or Scripts](/products/uc-local-apex-dev/docs/getting-started/install-apps-scripts/).
+- `local-26ai.sh used-space`: show the used database space against the 12GB limit of the Free edition.
+
+### More guides
+
+- **See every command**: read the [Command Reference](/products/uc-local-apex-dev/docs/reference/commands/).
+- **Change the installation**: read [Installation Details](/products/uc-local-apex-dev/docs/getting-started/installation-details/) for the container engine and the Podman compose provider.
+- **Use HTTPS on your machine**: read [SSL configuration](/products/uc-local-apex-dev/docs/getting-started/common-tasks/#ssl-configuration).
+- **Host the stack for a team**: read [Host as a Test Database](/products/uc-local-apex-dev/docs/getting-started/host-test-db/).

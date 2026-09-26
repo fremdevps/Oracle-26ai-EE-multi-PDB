@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+#
+# One-shot installer for uc-local-apex-dev.
+#
+# Runs setup.sh, pulls the container images, brings the stack up, waits for
+# the database to become ready, invokes scripts/after-first-db-start.sh
+# non-interactively (so the archive-logs prompt picks its default of
+# "disable"), then waits for ORDS to finish its first-boot install and
+# configures it. APEX and ORDS install into independent schemas, so both
+# installs run in parallel on purpose.
+#
+# Re-running on an already-installed checkout is safe: setup.sh is skipped
+# if .env already has all the keys we need, and the readiness loops return
+# immediately when the stack is already up.
+
+set -euo pipefail
+
+CURRENT_STEP="startup"
+trap 'echo "::error::install.sh failed during step: $CURRENT_STEP" >&2' ERR
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+# ---------------------------------------------------------------------------
+# 0. Parse arguments
+# ---------------------------------------------------------------------------
+# --secure enables a hardened install suitable for a hosted TEST db (not prod):
+# it turns off the ORDS surfaces that are reachable without app authentication
+# (Database REST API, SQL Developer Web / Database Actions, and debug-to-screen;
+# the MongoDB API is closed by not publishing its port) and makes new workspaces
+# use the random INTERNAL password instead of the shared 'Welcome_1'. It records
+# this as SECURE_MODE=true in .env (NOT FORCE_SECURE, which the Oracle ORDS image
+# reads itself). It does NOT touch network/port exposure -- front the stack with
+# your own firewall + TLS reverse proxy.
+SECURE=false
+
+# Edition flags. They only matter when .env does not exist yet: setup.sh writes
+# them into .env, and later runs read .env.
+#   --edition ee   Oracle AI Database 26ai Enterprise Edition (image built by
+#                  ./local-26ai.sh build-ee-image), one CDB with several PDBs.
+#   --pdbs LIST    EE: comma-separated PDB:POOL list. The first entry is created
+#                  with the CDB and served at /ords/ (pool "default").
+#   --sga MB / --pga MB   EE: SGA and PGA targets at database creation.
+#   --image TAG    EE: image tag (default oracle/database:23.26.0-ee).
+usage() {
+  echo "Usage: $0 [--secure] [--edition free|ee] [--pdbs LIST] [--sga MB] [--pga MB] [--image TAG]"
+  echo
+  echo "  --secure         Harden the install for a hosted DB (disables ORDS admin"
+  echo "                   surfaces, uses the random INTERNAL password for workspaces)."
+  echo "  --edition ee     Use Oracle AI Database 26ai Enterprise Edition."
+  echo "  --pdbs LIST      EE: PDB:POOL list, e.g. DEVPDB:default,TESTPDB:test"
+  echo "  --sga MB         EE: SGA target in MB (default 4096)"
+  echo "  --pga MB         EE: PGA target in MB (default 1024)"
+  echo "  --image TAG      EE: image tag (default oracle/database:23.26.0-ee)"
+  exit 1
+}
+
+need_value() {
+  if [ -z "${2:-}" ] || [[ "$2" == --* ]]; then
+    echo "Error: $1 needs a value" >&2
+    usage
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --secure)
+    SECURE=true
+    shift
+    ;;
+  --edition)
+    need_value "$1" "${2:-}"
+    export DB_EDITION="$2"
+    shift 2
+    ;;
+  --pdbs)
+    need_value "$1" "${2:-}"
+    export APEX_PDBS="$2"
+    shift 2
+    ;;
+  --sga)
+    need_value "$1" "${2:-}"
+    export INIT_SGA_SIZE="$2"
+    shift 2
+    ;;
+  --pga)
+    need_value "$1" "${2:-}"
+    export INIT_PGA_SIZE="$2"
+    shift 2
+    ;;
+  --image)
+    need_value "$1" "${2:-}"
+    export DB_IMAGE="$2"
+    shift 2
+    ;;
+  -h | --help)
+    usage
+    ;;
+  *)
+    echo "Error: Unknown parameter '$1'" >&2
+    usage
+    ;;
+  esac
+done
+
+banner() {
+  CURRENT_STEP="$1"
+  echo
+  echo "=== $1 ==="
+}
+
+fail_resumable() {
+  echo "ERROR: $1" >&2
+  echo >&2
+  echo "You can safely re-run ./install.sh — it picks up where it left off." >&2
+  exit 1
+}
+
+# set_env_kv KEY VALUE — set KEY="VALUE" in .env, updating in place if the key
+# already exists or appending it otherwise. Portable across BSD/macOS + GNU sed.
+set_env_kv() {
+  local key="$1" value="$2"
+  if grep -qE "^${key}=" .env; then
+    local tmp_env
+    tmp_env=$(mktemp)
+    sed "s/^${key}=.*/${key}=\"${value}\"/" .env >"$tmp_env"
+    mv "$tmp_env" .env
+  else
+    echo "${key}=\"${value}\"" >>.env
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 1. Preflight checks
+# ---------------------------------------------------------------------------
+banner "Preflight checks"
+
+# OS-aware "how to install the Compose plugin" guidance (compose_install_hint).
+# shellcheck source=scripts/util/compose-hint.sh
+source "$(dirname "${BASH_SOURCE[0]}")/scripts/util/compose-hint.sh"
+
+MISSING=()
+COMPOSE_ENGINE_FOR_HINT=""
+
+for cmd in sql unzip; do
+  if ! command -v "$cmd" &>/dev/null; then
+    MISSING+=("$cmd")
+  fi
+done
+
+if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+  MISSING+=("curl or wget")
+fi
+
+# Detect container engine (honor a pre-set CONTAINER_CLI, else prefer docker, fall back to podman).
+if [ -n "${CONTAINER_CLI:-}" ]; then
+  :
+elif command -v docker &>/dev/null; then
+  CONTAINER_CLI="docker"
+elif command -v podman &>/dev/null; then
+  CONTAINER_CLI="podman"
+else
+  CONTAINER_CLI=""
+  MISSING+=("docker or podman")
+fi
+
+# Detect its compose command. ONLY the native '<engine> compose' subcommand is
+# supported -- the standalone 'docker-compose' / 'podman-compose' tools are not.
+if [ -z "$CONTAINER_CLI" ]; then
+  :
+elif $CONTAINER_CLI compose version &>/dev/null 2>&1; then
+  DOCKER_COMPOSE="$CONTAINER_CLI compose"
+else
+  MISSING+=("$CONTAINER_CLI compose plugin")
+  COMPOSE_ENGINE_FOR_HINT="$CONTAINER_CLI"
+fi
+
+if [ ${#MISSING[@]} -gt 0 ]; then
+  echo "ERROR: required tools are missing:" >&2
+  for cmd in "${MISSING[@]}"; do
+    echo "  - $cmd" >&2
+  done
+  # The engine is present but its Compose plugin is not -- explain how to get it.
+  if [ -n "$COMPOSE_ENGINE_FOR_HINT" ]; then
+    echo >&2
+    compose_install_hint "$COMPOSE_ENGINE_FOR_HINT"
+  fi
+  exit 1
+fi
+
+echo "Using container engine: $CONTAINER_CLI"
+echo "Using compose command: $DOCKER_COMPOSE"
+echo "SQLcl version:"
+sql -V || true
+
+# ---------------------------------------------------------------------------
+# 2. .env handling
+# ---------------------------------------------------------------------------
+banner "Prepare .env"
+
+REQUIRED_ENV_KEYS=(
+  ORACLE_PASSWORD
+  ORACLE_PWD
+  DB_CONN_BASE
+  DB_CONN_NAME
+  CONTAINER_NAME
+  DBSERVICENAME
+  DBHOST
+  DBPORT
+  SECURE_MODE
+)
+
+if [ -f .env ]; then
+  echo ".env already exists — validating required keys."
+  missing_keys=()
+  for key in "${REQUIRED_ENV_KEYS[@]}"; do
+    if ! grep -qE "^${key}=" .env; then
+      missing_keys+=("$key")
+    fi
+  done
+  if [ ${#missing_keys[@]} -gt 0 ]; then
+    echo "ERROR: .env is missing required keys:" >&2
+    for key in "${missing_keys[@]}"; do
+      echo "  - $key" >&2
+    done
+    echo "Remove or fix .env and re-run ./install.sh" >&2
+    exit 1
+  fi
+  echo ".env looks good — reusing existing passwords."
+  env_edition=$(grep -E '^DB_EDITION=' .env | tail -1 | cut -d= -f2- | tr -d '"')
+  if [ -n "${DB_EDITION:-}" ] && [ "${DB_EDITION}" != "${env_edition:-free}" ]; then
+    echo "ERROR: --edition ${DB_EDITION} does not match DB_EDITION=${env_edition:-free} in .env." >&2
+    echo "The edition is fixed when .env is created. Remove .env (and the database volume) to change it." >&2
+    exit 1
+  fi
+else
+  echo "No .env found — running setup.sh."
+  ./setup.sh
+fi
+
+# When --secure is given, persist it into .env as SECURE_MODE=true so that both
+# this install and later `create-user` runs pick up the hardened behavior. We use
+# our own key name (NOT the Oracle ORDS image's FORCE_SECURE, which the image
+# entrypoint would read from this shared env_file and then refuse to boot without
+# TLS certs). We also turn DEBUG_TO_SCREEN off so debug-to-screen stays disabled
+# across restarts. Both keys always exist (setup.sh seeds them, SECURE_MODE is
+# validated above), so we update in place rather than append duplicates.
+if [ "$SECURE" = true ]; then
+  echo "Secure mode: setting SECURE_MODE=\"true\" and DEBUG_TO_SCREEN=\"false\" in .env"
+  set_env_kv SECURE_MODE true
+  set_env_kv DEBUG_TO_SCREEN false
+fi
+
+# Pull in $ORACLE_PASSWORD, the sql() TTY wrapper, and (again) $DOCKER_COMPOSE.
+# load_env.sh re-detects compose, which is fine — same result.
+# shellcheck disable=SC1091
+source ./scripts/util/load_env.sh
+
+# ---------------------------------------------------------------------------
+# 3. Pull images
+# ---------------------------------------------------------------------------
+banner "Pull container images"
+if [ "${DB_EDITION:-free}" = "ee" ]; then
+  # The EE image is built locally and never pulled (pull_policy: never).
+  if ! $CONTAINER_CLI image inspect "$DB_IMAGE" &>/dev/null; then
+    fail_resumable "the Enterprise Edition image $DB_IMAGE does not exist.
+Copy the install ZIP to ./ee-install/ and run: ./local-26ai.sh build-ee-image"
+  fi
+  echo "Using the local Enterprise Edition image $DB_IMAGE"
+  $DOCKER_COMPOSE pull ords-26ai
+else
+  $DOCKER_COMPOSE pull
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Start the stack
+# ---------------------------------------------------------------------------
+banner "Start the stack"
+# These bind-mount sources are gitignored (empty on a fresh checkout). Create
+# them up front so the bind mounts attach cleanly on every engine — Docker used
+# to auto-create them, but with explicit bind options (selinux relabel) that
+# implicit behaviour is no longer guaranteed. chmod 777 unconditionally (not just
+# on fresh create): under rootless podman the ORDS container's mapped user must be
+# able to write /etc/ords/config, and setup.sh's chmod is skipped when .env
+# already exists — so ensure the perms here, independent of setup.sh.
+mkdir -p ords-config apex-images
+chmod 777 ords-config apex-images
+# Start ONLY the database here, not the whole stack.
+#
+# ords-26ai has `depends_on: 26ai: condition: service_healthy`, so a plain
+# `up -d` makes compose wait for the database health status before it starts
+# ORDS. On rootless podman that wait can never end: from podman 5.5 or so the
+# health status never leaves "starting" over the Docker-compatible API socket
+# that `podman compose` talks to. It never reports unhealthy either, so compose
+# has no failure to report and simply waits. podman 4.9.3 reported Healthy after
+# 12 seconds; 5.8.4 reports nothing, which hung this script for 90 minutes on
+# "Container local-26ai Waiting" -- before the readiness loop below ever ran.
+#
+# So do the waiting here instead. Step 5 reads the "DATABASE IS READY TO USE"
+# banner out of the log, which works the same on every engine and every version.
+# The remaining services start after it, with --no-deps, so no health gate is
+# consulted. docker behaves exactly as before, and docker-compose.yml keeps its
+# depends_on for anyone who runs `local-26ai.sh start` by hand.
+$DOCKER_COMPOSE up -d 26ai
+
+# ---------------------------------------------------------------------------
+# 5. Wait for the database to be ready
+# ---------------------------------------------------------------------------
+# EE runs DBCA on the first boot, which is much slower than the prebuilt Free
+# database. DB_READY_TIMEOUT_MIN in .env (setup.sh writes 90 for EE).
+DB_READY_TIMEOUT_MIN="${DB_READY_TIMEOUT_MIN:-25}"
+banner "Wait for database to be ready (up to ${DB_READY_TIMEOUT_MIN} minutes)"
+wait_start=$SECONDS
+deadline=$((SECONDS + DB_READY_TIMEOUT_MIN * 60))
+progress_at=$((SECONDS + 60))
+db_ready=false
+while (( SECONDS < deadline )); do
+  # Capture the logs first, then match against the variable -- do NOT pipe
+  # straight into `grep -q`. Under `set -o pipefail`, grep closes the pipe on
+  # its first match (SIGPIPE to the writer) and `podman compose logs` can also
+  # exit non-zero on its own, either of which makes the *pipeline* non-zero even
+  # when the banner matched -- so the `if` never fired and the podman leg looped
+  # until timeout despite the DB being ready. docker's compose logs exits clean,
+  # which is why only podman hung. The capture + case match avoids the pipe.
+  db_log=$($DOCKER_COMPOSE logs 26ai 2>&1 || true)
+  case "$db_log" in
+  *"DATABASE IS READY TO USE"*)
+    echo "Database is ready."
+    db_ready=true
+    break
+    ;;
+  esac
+  if (( SECONDS >= progress_at )); then
+    echo "Still waiting for the database first boot... ($(( (SECONDS - wait_start) / 60 ))/${DB_READY_TIMEOUT_MIN} min)"
+    progress_at=$((SECONDS + 60))
+  fi
+  sleep 10
+done
+
+if [ "$db_ready" != true ]; then
+  printf '%s\n' "$db_log" | tail -100 >&2 || true
+  fail_resumable "database did not become ready within ${DB_READY_TIMEOUT_MIN} minutes"
+fi
+
+# Now start the rest of the stack. --no-deps keeps compose from evaluating the
+# service_healthy condition on 26ai (see the note at step 4) -- the database is
+# provably ready at this point, so the gate has nothing left to protect.
+banner "Start the remaining services"
+$DOCKER_COMPOSE up -d --no-deps ords-26ai
+
+# ---------------------------------------------------------------------------
+# 6. Verify the host can reach the database via SQLcl
+# ---------------------------------------------------------------------------
+# Fail fast (with the real SQLcl error) when the host-side connection is
+# broken -- e.g. a defunct Java/SQLcl setup or something else answering on
+# port 1521. Without this check such problems would only surface as a silent
+# timeout in the ORDS wait below. The short retry window covers the listener
+# service-registration race right after the DB-ready banner.
+banner "Verify host database connection"
+deadline=$((SECONDS + 120))
+db_conn_ok=false
+while (( SECONDS < deadline )); do
+  conn_out=$(sql -S "sys/${ORACLE_PASSWORD}@localhost:1521/${DBSERVICENAME}" as SYSDBA <<'SQL' 2>&1 || true
+set heading off feedback off pagesize 0
+select 1 from dual;
+exit
+SQL
+  )
+  # SQLcl on Java 24+ can prepend JVM noise on stderr -- either a
+  # "Picked up JAVA_TOOL_OPTIONS: ..." line (env var set) or a multi-line
+  # "WARNING: restricted method ..." block (env var not set) -- and the 2>&1
+  # above folds it into conn_out. Match a standalone "1" line rather than
+  # squishing the whole blob, so leading noise no longer defeats the check.
+  if printf '%s\n' "$conn_out" | grep -qxE '[[:space:]]*1[[:space:]]*'; then
+    echo "Host database connection works."
+    db_conn_ok=true
+    break
+  fi
+  sleep 10
+done
+
+if [ "$db_conn_ok" != true ]; then
+  echo "Last SQLcl output:" >&2
+  printf '%s\n' "$conn_out" >&2
+  fail_resumable "cannot connect to the database from this host (sys@localhost:1521/${DBSERVICENAME}).
+Check that SQLcl ('sql') and its Java runtime work and that nothing else occupies port 1521."
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Run after-first-db-start.sh non-interactively
+# ---------------------------------------------------------------------------
+# Runs BEFORE the ORDS wait on purpose: it only needs the database (creates
+# tablespaces, downloads + installs APEX, sets the ADMIN password), while the
+# ORDS container is still busy with its own first-boot install. The two touch
+# independent schemas (APEX_* vs ORDS_METADATA/ORDS_PUBLIC_USER), so running
+# them in parallel absorbs slow machines where ORDS alone used to blow the
+# 15-minute budget.
+banner "Run after-first-db-start.sh (installs APEX, applies space optimizations)"
+# Idempotency: after-first-db-start.sh creates tablespaces and runs apexins.sql,
+# neither of which is re-runnable — on an already-installed DB it fails hard (and
+# a previous version wiped apex-images mid-run). Detect an existing APEX install
+# and skip the step so a re-run of install.sh genuinely "picks up where it left
+# off". The versioned APEX schema (e.g. APEX_260100) exists only after apexins.sql
+# has run, so its presence is a reliable "already installed" signal.
+apex_installed=$(sql -S "sys/${ORACLE_PASSWORD}@localhost:1521/${DBSERVICENAME}" as SYSDBA <<'SQL' 2>/dev/null | grep -oE '[0-9]+' | head -1 || true
+set heading off feedback off pagesize 0
+select count(*) from dba_users where regexp_like(username, '^APEX_[0-9]+$');
+exit
+SQL
+)
+if [ -n "$apex_installed" ] && [ "$apex_installed" -gt 0 ] 2>/dev/null; then
+  echo "APEX is already installed — skipping after-first-db-start.sh."
+else
+  # Closing stdin makes the archive-logs prompt take its default (Y, disable).
+  # The APEX ADMIN password is no longer prompted — it reuses ORACLE_PASSWORD.
+  ./scripts/after-first-db-start.sh </dev/null
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Wait for ORDS to finish its first-boot install
+# ---------------------------------------------------------------------------
+banner "Wait for ORDS to be ready (up to 15 minutes)"
+ords_query() {
+  sql -S "sys/${ORACLE_PASSWORD}@localhost:1521/${DBSERVICENAME}" as SYSDBA <<'SQL'
+set heading off feedback off pagesize 0
+select count(*) from dba_synonyms
+ where owner = 'PUBLIC' and synonym_name = 'ORDS';
+exit
+SQL
+}
+wait_start=$SECONDS
+deadline=$((SECONDS + 900))
+progress_at=$((SECONDS + 60))
+ords_ready=false
+while (( SECONDS < deadline )); do
+  count=$(ords_query 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)
+  if [ "$count" = "1" ]; then
+    echo "ORDS is ready."
+    ords_ready=true
+    break
+  fi
+  # A dead ORDS container will never finish installing -- fail fast instead
+  # of burning the whole timeout.
+  running=$($CONTAINER_CLI inspect -f '{{.State.Running}}' local-26ai-ords 2>/dev/null || true)
+  if [ "$running" != "true" ]; then
+    $DOCKER_COMPOSE logs ords-26ai 2>/dev/null | tail -200 >&2 || true
+    fail_resumable "the ORDS container (local-26ai-ords) is not running"
+  fi
+  if (( SECONDS >= progress_at )); then
+    echo "Still waiting for the ORDS first-boot install... ($(( (SECONDS - wait_start) / 60 ))/15 min)"
+    progress_at=$((SECONDS + 60))
+  fi
+  sleep 10
+done
+
+if [ "$ords_ready" != true ]; then
+  echo "Last readiness check output:" >&2
+  check_out=$(ords_query 2>&1 || true)
+  printf '%s\n' "$check_out" >&2
+  $DOCKER_COMPOSE logs ords-26ai 2>/dev/null | tail -200 >&2 || true
+  fail_resumable "ORDS did not finish installing within 15 minutes"
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Configure ORDS pl/sql gateway mode = proxied
+# ---------------------------------------------------------------------------
+# `proxied` is the default in ORDS 26.x but older images (and explicit configs)
+# may pick `direct`. Setting it explicitly keeps the APEX URL working with
+# workspace-level proxy auth in all cases. The command is idempotent. It must
+# stay after the ORDS wait so the first-boot installer cannot overwrite it.
+banner "Configure ORDS plsql.gateway.mode = proxied"
+$CONTAINER_CLI exec local-26ai-ords bash -c \
+  "ords --config /etc/ords/config config --db-pool default set plsql.gateway.mode proxied"
+
+# ---------------------------------------------------------------------------
+# 9b. (secure) Disable ORDS surfaces reachable without app authentication
+# ---------------------------------------------------------------------------
+# Only in --secure mode: turn off the ORDS admin/management surfaces that are
+# otherwise exposed on a hosted instance. The APEX runtime + gateway keep
+# working; only these extra surfaces are removed. Applied via the same
+# `ords config` CLI as the gateway step so it lands in the mounted config, and
+# the restart below makes it take effect. Idempotent.
+#
+# Only settings that PERSIST are set here. Notably absent:
+#   - mongo.enabled: the ORDS image entrypoint runs `ords config set mongo.enabled
+#     true` on every boot, so setting it false is cosmetic. The MongoDB API is
+#     closed instead by NOT publishing its port (27017 is not in docker-compose).
+#   - debug.printDebugToScreen: driven by the DEBUG env var (DEBUG_TO_SCREEN in
+#     .env, set to false above in secure mode), which the image re-applies every
+#     boot.
+if [ "$SECURE" = true ]; then
+  banner "Secure mode: disable ORDS Database API, SQL Developer Web / Database Actions"
+  $CONTAINER_CLI exec local-26ai-ords bash -c '
+    set -e
+    ords --config /etc/ords/config config set database.api.enabled false
+    ords --config /etc/ords/config config --db-pool default set feature.sdw false
+  '
+fi
+
+# ---------------------------------------------------------------------------
+# 9c. (EE) The other PDBs: create each one, install APEX, add its ORDS pool
+# ---------------------------------------------------------------------------
+# The first APEX_PDBS entry is the PDB that DBCA created, handled by steps 5-9.
+# create-pdb.sh is idempotent, so a re-run skips the PDBs that are complete.
+if [ "${DB_EDITION:-free}" = "ee" ]; then
+  IFS=',' read -r -a pdb_entries <<<"${APEX_PDBS:-}"
+  for entry in "${pdb_entries[@]:1}"; do
+    banner "Enterprise Edition: PDB ${entry%%:*} (ORDS pool ${entry#*:})"
+    ./scripts/create-pdb.sh "${entry%%:*}" "${entry#*:}" --no-restart ||
+      fail_resumable "create-pdb failed for ${entry}"
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# 10. Restart ORDS so it picks up APEX + the config change
+# ---------------------------------------------------------------------------
+banner "Restart ORDS to pick up APEX module"
+$DOCKER_COMPOSE restart ords-26ai
+# Wait for ORDS to come back so callers (and CI) can immediately use it.
+deadline=$((SECONDS + 180))
+while (( SECONDS < deadline )); do
+  # Capture then match (no pipe into grep) for the same pipefail reason as the
+  # DB wait above: a non-zero curl/exec while ORDS is still restarting must not
+  # be masked into a false positive, nor a SIGPIPE into a false negative.
+  http=$($CONTAINER_CLI exec local-26ai-ords bash -c \
+    "curl -fsS -o /dev/null -w '%{http_code}' http://localhost:8080/ords/" 2>/dev/null || true)
+  case "$http" in
+  200 | 30[0-9])
+    echo "ORDS is back."
+    break
+    ;;
+  esac
+  sleep 5
+done
+
+# ---------------------------------------------------------------------------
+# 11. Final summary
+# ---------------------------------------------------------------------------
+banner "Done"
+if [ "${DB_EDITION:-free}" = "ee" ]; then
+  echo "Enterprise Edition — one APEX per PDB:"
+  IFS=',' read -r -a pdb_entries <<<"${APEX_PDBS:-}"
+  for entry in "${pdb_entries[@]}"; do
+    if [ "${entry#*:}" = "default" ]; then
+      printf '  %-12s http://localhost:8181/ords/\n' "${entry%%:*}"
+    else
+      printf '  %-12s http://localhost:8181/ords/%s/\n' "${entry%%:*}" "${entry#*:}"
+    fi
+  done
+  echo "  Commands on a PDB: ./local-26ai.sh --pdb <PDB> <command>"
+  echo
+fi
+cat <<EOF
+The stack is up and APEX is installed.
+
+  APEX:           https://localhost:8181/ords/
+  APEX workspace: INTERNAL / ADMIN / (your ORACLE_PASSWORD from .env)
+  SYS connection: sql -name "\$DB_CONN_NAME"   (after sourcing scripts/util/load_env.sh)
+
+Next: create a workspace + schema for your app:
+
+  ./local-26ai.sh create-user <NAME>
+
+EOF
+
+if [ "$SECURE" = true ]; then
+  cat <<'EOF'
+Secure mode (SECURE_MODE=true) is enabled:
+  - ORDS Database REST API and SQL Developer Web / Database Actions are DISABLED.
+  - Debug-to-screen is off (DEBUG_TO_SCREEN=false in .env).
+  - The MongoDB API is closed because its port (27017) is not published.
+  - New workspaces (create-user) use the random ORACLE_PASSWORD, not 'Welcome_1'.
+
+This does NOT restrict network/port exposure and does NOT rotate the plaintext
+secrets in .env / ords-secrets/conn_string.txt. Before hosting: put the stack
+behind a firewall + TLS reverse proxy.
+
+EOF
+fi

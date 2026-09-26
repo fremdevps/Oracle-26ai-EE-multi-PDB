@@ -1,0 +1,132 @@
+---
+title: Creating Users
+description: Learn how to create database users and APEX workspaces in your local APEX development environment.
+sidebar:
+  order: 3
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+## Create User and Workspace
+
+Create a new database schema and APEX workspace in one command:
+
+```bash
+local-26ai.sh create-user movies
+```
+
+The command does the following:
+
+- Creates a schema with the name that you give
+- Stores the schema password in the `.env` file
+- Saves the connection in the connection store of SQLcl
+- Adds the development grants
+- Gives access to the datapump directories
+- Creates an APEX workspace
+- Sets the workspace settings for session length, maximum emails, REST messages, and password lifetime
+
+<Aside type="tip" title="Access Credentials">
+  Log in to the workspace with these values:
+
+  - **Username**: `ADMIN` or the schema name, for example `MOVIES`
+  - **Password**: `Welcome_1`
+  - **URL**: http://localhost:8181/ords/apex
+</Aside>
+
+<Aside type="note" title="Use a random password instead of Welcome_1">
+  By default, new workspaces use the shared development password `Welcome_1`. To
+  use the random `ORACLE_PASSWORD` value from `.env` instead, set
+  `WORKSPACE_USE_INTERNAL_PASSWORD=true` in that file. This is the same password
+  as the `ADMIN` user of the APEX Internal workspace. Every workspace that you
+  create after this change uses it for both the `ADMIN` user and the schema user.
+</Aside>
+
+### Create Schema Only
+
+If you only need a database schema without an APEX workspace:
+
+```bash
+local-26ai.sh create-user myschema --skip-workspace
+```
+
+### Create a Compressed Schema
+
+Add `--compress` to enable [Advanced Compression](https://www.oracle.com/database/advanced-compression/) on the tablespace of the new schema. Oracle Database Free includes this feature.
+
+The database then compresses every table and index that you create later. Tables get advanced row compression. B-tree indexes get advanced index compression. The schema uses less disk space as it grows.
+
+```bash
+local-26ai.sh create-user movies --compress
+# Combine with other flags as needed:
+local-26ai.sh create-user myschema --skip-workspace --compress
+```
+
+<Aside type="tip" title="Already have data?">
+  `--compress` sets the defaults for *new* segments only. Use it on a fresh schema. If the schema already contains data, use [`compress-space`](/products/uc-local-apex-dev/docs/getting-started/common-tasks/#compress-a-schemas-tablespace) instead.
+</Aside>
+
+### Clear a Schema
+
+Drop all objects in a schema and keep the schema itself. Use this command when you test an install script many times:
+
+```bash
+local-26ai.sh clear-schema movies
+# Asks for confirmation before proceeding
+```
+
+To skip the confirmation prompt, use the `-y` flag. Use this flag in scripts and CI jobs:
+
+```bash
+local-26ai.sh clear-schema movies -y
+```
+
+<Aside type="caution" title="Data Loss Warning">
+  Do not run this command on a schema with important data. The command drops all
+  objects in the schema. Run backups regularly.
+</Aside>
+
+### Drop a Schema
+
+Drop a schema and all its objects. The command also drops the tablespace of the schema and its datafile. The database returns the disk space to the operating system, so no orphan file stays behind:
+
+```bash
+local-26ai.sh drop-user movies
+# Asks for confirmation before proceeding
+```
+
+To skip the confirmation prompt, use the `-y` flag. Use this flag in scripts and CI jobs:
+
+```bash
+local-26ai.sh drop-user movies -y
+```
+
+<Aside type="caution" title="Data Loss Warning">
+  Do not run this command without a backup. The command drops the schema, all its
+  objects, and its datafile permanently.
+</Aside>
+
+## Database Access
+
+### SQLcl and SQL Developer Access
+
+`create-user` stores every new user in the connection store of SQLcl:
+
+```bash
+# Connect using the stored connection
+sql -name local-26ai-movies
+
+# Connect to sys user
+sql -name local-26ai-sys
+```
+
+The connections also appear in the VS Code SQL Developer extension. After you create a user, refresh the connection list.
+
+### Other Development Tools
+
+Use these connection details for other development tools:
+
+- **Host**: localhost
+- **Port**: 1521
+- **Service**: FREEPDB1
+- **Username**: Your schema name
+- **Password**: The `<NAME>_USER_PASSWORD` value in the `.env` file

@@ -1,0 +1,87 @@
+---
+title: Command Reference
+description: Every command available in uc-local-apex-dev at a glance — container management, users, backups, testing, and maintenance.
+sidebar:
+  order: 1
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+The `local-26ai.sh` wrapper gives you every feature of this project as a single command. This page lists all of them. Run `local-26ai.sh --help` to see the same list in your terminal.
+
+```bash
+local-26ai.sh <command> [arguments]
+```
+
+<Aside type="tip" title="Direct script access">
+  Every command is a script in the `./scripts` folder. `local-26ai.sh create-user
+  movies` and `./scripts/create-user.sh movies` do the same.
+</Aside>
+
+## Containers
+
+| Command | Description |
+| ------- | ----------- |
+| `start` | Start the database and ORDS containers. |
+| `stop` | Shut the database down cleanly, then stop the containers. |
+
+See [Common Tasks → Managing Containers](/products/uc-local-apex-dev/docs/getting-started/common-tasks/#managing-containers).
+
+## Users & Workspaces
+
+| Command | Description |
+| ------- | ----------- |
+| `create-user <name>` | Create a database schema and an APEX workspace with all development grants. Use `--skip-workspace` for a schema only. Use `--compress` to store the data compressed. |
+| `clear-schema <name>` | Drop all objects in a schema and keep the schema itself. Use it to test an install script many times. `-y` skips the confirmation. |
+| `drop-user <name>` | Drop a schema with its tablespace and datafile. `-y` skips the confirmation. |
+
+See [Creating Users](/products/uc-local-apex-dev/docs/getting-started/creating-users/).
+
+## Backups & Import
+
+| Command | Description |
+| ------- | ----------- |
+| `backup-all` | Export every schema with DataPump to `./backups/export`, with the APEX workspaces, applications, and ORDS modules. |
+| `backup-user <name>` | Export a single schema with DataPump, with its APEX workspace and applications. |
+| `import-backup <name>` | Restore a schema from a backup. If the user does not exist, the script creates it first. |
+| `import-datapump <name> [-rs <target>]` | Import a DataPump dump for a schema. With `-rs` the script imports the dump into a different schema name. |
+| `import-all` | Import every export file in `./backups/import`. Use it during a migration. |
+| `sync-backups-folder` | Copy `./backups/import` into the DataPump directory of the container, and copy new exports back out. |
+| `fix-ws-group-ids` | Delete the group IDs from the APEX workspace export files in `./backups/import`, so the files import correctly. |
+
+See [Backups](/products/uc-local-apex-dev/docs/getting-started/backups/) and [Common Tasks → Workspace Import/Export](/products/uc-local-apex-dev/docs/getting-started/common-tasks/#workspace-importexport).
+
+## Testing Installs
+
+| Command | Description |
+| ------- | ----------- |
+| `test-app-install <file.sql>` | Install an APEX application export into the clean `UC_TESTINSTALL_1` schema. Shows object counts, invalid objects, and the results of the dependency scan. `-y` skips the confirmation. |
+| `test-script-install <file.sql>` | Run any SQL script in the clean `UC_TESTINSTALL_1` schema. Shows object counts and invalid objects. `-y` skips the confirmation. |
+
+See [Install Apps or Scripts](/products/uc-local-apex-dev/docs/getting-started/install-apps-scripts/).
+
+## Disk Space
+
+| Command | Description |
+| ------- | ----------- |
+| `used-space` | Show the used database space per tablespace, against the 12GB limit of the Free edition. `--summary` gives `key=value` lines, and `--quiet` gives the exit code alone. The exit code is `0` for OK, `10` for `WARNING`, and `11` for `CRITICAL`. |
+| `cap-tablespaces` | Give every datafile a size ceiling, so one datafile cannot fill the 12GB limit alone. `--check` reports and changes nothing. `--apply` sets the ceilings. `-y` skips the confirmation. |
+| `shrink-space` | Shrink tablespaces and datafiles to reclaim unused space. |
+| `compress-space <name>` | Enable Advanced Compression on the tablespace of a schema, rebuild its objects in compressed form, and return the free space to the operating system. `-y` skips the confirmation. |
+
+See [Common Tasks → Maintenance Tasks](/products/uc-local-apex-dev/docs/getting-started/common-tasks/#maintenance-tasks).
+
+## Setup & Maintenance
+
+| Command | Description |
+| ------- | ----------- |
+| `after-first-db-start` | Install APEX and apply the defaults for development. `install.sh` runs this command. You need it only for a manual installation. |
+| `upgrade-apex` | Download the latest APEX version, run the installer, copy the images, and set the workspace settings again. |
+| `repair-ru-dictionary` | Repair the data dictionary after a change of the database image. A new release update adds dictionary views and a new in-database JVM, and the image change does not install them. `--check` reports and changes nothing. `--repair` applies the repair. `--summary` gives `key=value` lines. |
+| `unexpire-accounts` | Unlock the APEX and ORDS accounts. This corrects an "Account Is Locked" message. |
+| `disable-password-expiration` | Stop the passwords of database accounts from expiring. |
+| `disable-archive-logs` | Disable archive logging to save disk space. Archive logs are not necessary in development. |
+| `create-self-signed-certificates` | Create self-signed SSL certificates so ORDS serves HTTPS on port 8443. Run with `sudo`. |
+| `install-dbms-cloud` | Install the `DBMS_CLOUD` package into the database. |
+
+See [Upgrade APEX](/products/uc-local-apex-dev/docs/migrations/upgrade-apex/) and [Common Tasks](/products/uc-local-apex-dev/docs/getting-started/common-tasks/).

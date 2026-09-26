@@ -1,0 +1,472 @@
+name: Test clean install
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+      - "25-*"
+      - "26-*"
+  pull_request:
+    branches:
+      - main
+      - master
+      - "25-*"
+      - "26-*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  clean-install:
+    name: clean-install (${{ matrix.engine }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [docker, podman]
+
+    # Force the engine the scripts pick. ubuntu-latest ships Docker, and the
+    # auto-detection prefers it — without this, the podman leg would silently
+    # run on Docker and prove nothing.
+    env:
+      CONTAINER_CLI: ${{ matrix.engine }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rootless podman defaults to the userspace fuse-overlayfs graph driver,
+      # which makes Oracle's write-heavy first boot ~2x slower than docker
+      # (~28 min vs ~15 min for the same image) and pushed the DB past the
+      # readiness timeout. Modern runner kernels support rootless *native*
+      # kernel overlay, which is far faster; select it by clearing the fuse
+      # mount_program. Written before any podman command so it applies to a
+      # still-empty storage graph. If the kernel can't do rootless native
+      # overlay, `podman info` fails -- wipe the (empty) graph + our config and
+      # fall back to the default driver so the leg still runs, just slower.
+      - name: Use native overlay storage for rootless podman
+        if: matrix.engine == 'podman'
+        run: |
+          set -euo pipefail
+          conf="$HOME/.config/containers/storage.conf"
+          mkdir -p "$(dirname "$conf")"
+          cat > "$conf" <<'CONF'
+          [storage]
+          driver = "overlay"
+
+          [storage.options.overlay]
+          mount_program = ""
+          CONF
+          if podman info > /tmp/podman-info.txt 2>&1; then
+            echo "podman storage initialized with native overlay"
+          else
+            echo "native overlay unsupported; falling back to default storage"
+            rm -f "$conf"
+            rm -rf "$HOME/.local/share/containers/storage"
+          fi
+          grep -iE 'graphDriverName|mount_program|graphRoot' /tmp/podman-info.txt || true
+
+      # podman is preinstalled on ubuntu-latest, but `podman compose` delegates
+      # to an external provider (the docker compose v2 plugin already on the
+      # runner). That provider talks to podman's Docker-compatible API socket as
+      # if it were a Docker daemon, so we must enable the rootless podman socket.
+      # enable-linger keeps the user's systemd manager (and the socket) alive
+      # across the separate `run:` steps. We deliberately do NOT install
+      # podman-compose (it doesn't support the full compose spec this project's
+      # docker-compose.yml relies on).
+      - name: Enable Podman API socket
+        if: matrix.engine == 'podman'
+        run: |
+          set -euo pipefail
+          podman --version
+          sudo loginctl enable-linger "$USER"
+          systemctl --user enable --now podman.socket
+          sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+          test -S "$sock" && echo "podman socket listening at $sock"
+          podman compose version
+
+      # Oracle Free image (~9 GB) + oradata after apexins (~6 GB) does not
+      # fit in the default 14 GB of free space on ubuntu-latest. This action
+      # frees ~25 GB by removing preinstalled toolchains we don't need.
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Oracle's "latest" SQLcl zip, extracted straight to $HOME/sqlcl. We used
+      # to pin a version through sqlv, but its index only carries the two
+      # releases Oracle currently advertises, so a pin breaks as soon as Oracle
+      # rotates them.
+      - name: Install SQLcl (latest)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/sqlcl.zip" \
+            https://download.oracle.com/otn_software/java/sqldeveloper/sqlcl-latest.zip
+          unzip -q "$RUNNER_TEMP/sqlcl.zip" -d "$HOME"
+          # Persist PATH for later steps
+          echo "$HOME/sqlcl/bin" >> "$GITHUB_PATH"
+          "$HOME/sqlcl/bin/sql" -V
+
+      # install.sh is the one-shot installer end users run: it generates
+      # .env via setup.sh, pulls images, brings the stack up, waits for the
+      # DB and ORDS, and runs after-first-db-start.sh with safe defaults.
+      # Running it here also serves as its regression test.
+      - name: Run install.sh
+        run: ./install.sh
+
+      - name: Verify apex-images folder layout
+        run: |
+          set -euo pipefail
+          # Regression guard: a previous user hit `cp` nesting the source
+          # folder into the destination (./apex-images/images/...). The
+          # contents must live at the top of ./apex-images/ instead.
+          test -f ./apex-images/apex_version.txt
+          test -d ./apex-images/libraries
+          test -d ./apex-images/themes
+          test ! -e ./apex-images/images
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./scripts/util/load_env.sh
+          # `apxchpwd.sql` is piped without `whenever sqlerror exit failure`,
+          # so an ORA-20001 from APEX password validation is silently swallowed
+          # and the ADMIN account ends up missing. Assert it actually exists.
+          sql -name "$DB_CONN_NAME" <<'SQL' | sed 's/[[:space:]]*$//' | tee smoke.out
+          whenever sqlerror exit failure
+          set heading off feedback off pagesize 0
+          select 'db_version: ' || banner_full from v$version where rownum = 1;
+          select 'apex_version: ' || version_no from apex_release;
+          select 'workspace_count: ' || count(*) from apex_workspaces;
+          select 'apex_internal_admin=' || count(*) from apex_workspace_apex_users where user_name = 'ADMIN' and workspace_name = 'INTERNAL';
+          -- Instance parameters applied by upgrade-apex.sh (via
+          -- apex_instance_admin.set_parameter). Read them back through the
+          -- supported API and assert below. upgrade-apex.sh's SQL heredoc has no
+          -- `whenever sqlerror exit failure`, so a mistyped parameter name there
+          -- would otherwise pass CI green — these asserts are the real guard.
+          -- STRONG_SITE_ADMIN_PASSWORD is deliberately NOT asserted here: it is
+          -- only relaxed transiently so apxchpwd accepts the alphanumeric
+          -- password, and gets reset to the 'Y' default afterwards. Its effect
+          -- is covered instead by the apex_internal_admin=1 check above — if the
+          -- relaxation had failed, apxchpwd would reject the password and ADMIN
+          -- would be missing.
+          select 'p_idle='    || apex_instance_admin.get_parameter('MAX_SESSION_IDLE_SEC')    from dual;
+          select 'p_length='  || apex_instance_admin.get_parameter('MAX_SESSION_LENGTH_SEC')  from dual;
+          select 'p_account=' || apex_instance_admin.get_parameter('ACCOUNT_LIFETIME_DAYS')   from dual;
+          select 'p_backups=' || apex_instance_admin.get_parameter('MAX_APPLICATION_BACKUPS') from dual;
+          exit
+          SQL
+          grep -qx 'apex_internal_admin=1' smoke.out
+          grep -qx 'p_idle=604800'  smoke.out
+          grep -qx 'p_length=604800' smoke.out
+          grep -qx 'p_account=9999'  smoke.out
+          grep -qx 'p_backups=3'     smoke.out
+
+      # -----------------------------------------------------------------
+      # Script tests — exercise the user-facing scripts against the real
+      # DB+APEX that was just installed.
+      # -----------------------------------------------------------------
+
+      - name: Test create-user.sh
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./scripts/util/load_env.sh
+
+          ./scripts/create-user.sh CITEST1
+
+          # User and workspace must exist; saved sqlcl connection must work.
+          # SQLcl right-pads output to the column width, so strip trailing
+          # whitespace before asserting with `grep -qx`.
+          sql -S -name "$DB_CONN_NAME" <<'SQL' | sed 's/[[:space:]]*$//' | tee create_user.out
+          whenever sqlerror exit failure
+          set heading off feedback off pagesize 0
+          select 'users=' || count(*) from dba_users where username = 'CITEST1';
+          select 'ws='    || count(*) from apex_workspaces where workspace = 'CITEST1';
+          -- The per-schema tablespace MUST carry a size ceiling. Without this
+          -- assertion a future edit to create-user.sh silently goes back to
+          -- unbounded autoextend, and CI stays green while one runaway schema
+          -- can push the PDB past the 12 GB Free-edition limit -- after which
+          -- the PDB does not open at all and cannot be repaired from inside.
+          select 'tbs_max=' || maxbytes from dba_data_files
+           where tablespace_name = 'TBS_CITEST1';
+          exit
+          SQL
+          grep -qx 'users=1' create_user.out
+          grep -qx 'ws=1'    create_user.out
+          grep -qx 'tbs_max=2147483648' create_user.out
+
+          # .env must hold the generated password
+          grep -q '^CITEST1_USER_PASSWORD=' .env
+
+          # The saved per-user connection must be usable
+          sql -S -name "${DB_CONN_BASE}-citest1" <<'SQL' | sed 's/[[:space:]]*$//' | tee whoami.out
+          whenever sqlerror exit failure
+          set heading off feedback off pagesize 0
+          select user from dual;
+          exit
+          SQL
+          grep -qx 'CITEST1' whoami.out
+
+      - name: Test test-script-install.sh
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./scripts/util/load_env.sh
+
+          # test-script-install.sh resolves relative paths against $ORIGINAL_PWD
+          # (which isn't always set), so pass an absolute path to be safe.
+          ./scripts/test-script-install.sh "$PWD/.github/fixtures/test_install.sql" -y
+
+          sql -S -name "${DB_CONN_BASE}-uc_testinstall_1" <<'SQL' | sed 's/[[:space:]]*$//' | tee install.out
+          whenever sqlerror exit failure
+          set heading off feedback off pagesize 0
+          select 'table='   || count(*) from user_tables  where table_name  = 'T_WIDGETS';
+          select 'pkg='     || count(*) from user_objects where object_type = 'PACKAGE'      and object_name = 'PKG_WIDGETS' and status = 'VALID';
+          select 'pkgbody=' || count(*) from user_objects where object_type = 'PACKAGE BODY' and object_name = 'PKG_WIDGETS' and status = 'VALID';
+          select 'rows='    || pkg_widgets.get_count from dual;
+          select 'invalid=' || count(*) from user_objects where status = 'INVALID';
+          exit
+          SQL
+          grep -qx 'table=1'   install.out
+          grep -qx 'pkg=1'     install.out
+          grep -qx 'pkgbody=1' install.out
+          grep -qx 'rows=3'    install.out
+          grep -qx 'invalid=0' install.out
+
+      - name: Seed CITEST1 with test data for backup
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./scripts/util/load_env.sh
+
+          sql -S -name "${DB_CONN_BASE}-citest1" <<'SQL'
+          whenever sqlerror exit failure
+          create table t_backup_data (
+            id  number generated by default as identity primary key,
+            val varchar2(100) not null
+          );
+          insert into t_backup_data (val) values ('row-one');
+          insert into t_backup_data (val) values ('row-two');
+          insert into t_backup_data (val) values ('row-three');
+          commit;
+          exit
+          SQL
+
+      - name: Test backup-user.sh
+        run: |
+          set -euo pipefail
+          ./scripts/backup-user.sh CITEST1
+
+          # Datapump dump must exist and be non-empty.
+          test -s ./backups/export/citest1.dmp
+          # APEX workspace export must produce at least one w*.sql file.
+          ls ./backups/export/apex/citest1/w*.sql >/dev/null
+
+      - name: Test drop-user.sh
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./scripts/util/load_env.sh
+
+          ./scripts/drop-user.sh CITEST1 -y
+
+          sql -S -name "$DB_CONN_NAME" <<'SQL' | sed 's/[[:space:]]*$//' | tee drop.out
+          whenever sqlerror exit failure
+          set heading off feedback off pagesize 0
+          select 'users=' || count(*) from dba_users where username = 'CITEST1';
+          -- drop-user also drops the per-user tablespace + datafile, so the
+          -- space is reclaimed instead of leaking as an orphan.
+          select 'tbs=' || count(*) from dba_tablespaces where tablespace_name = 'TBS_CITEST1';
+          exit
+          SQL
+          grep -qx 'users=0' drop.out
+          grep -qx 'tbs=0'   drop.out
+
+          # drop-user.sh comments out the password line in .env
+          grep -q '^# *CITEST1_USER_PASSWORD=' .env
+
+      - name: Test import-backup.sh (round-trip)
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./scripts/util/load_env.sh
+
+          # Stage the previously-exported artifacts as if they came from
+          # another machine.
+          mkdir -p ./backups/import/apex
+          cp ./backups/export/citest1.dmp ./backups/import/citest1.dmp
+          cp -r ./backups/export/apex/citest1 ./backups/import/apex/citest1
+
+          ./scripts/import-backup.sh CITEST1 -y
+
+          # Reload .env — import-backup re-created the user with a new
+          # generated password and appended a fresh line.
+          # shellcheck disable=SC1091
+          source ./scripts/util/load_env.sh
+
+          sql -S -name "${DB_CONN_BASE}-citest1" <<'SQL' | sed 's/[[:space:]]*$//' | tee restore.out
+          whenever sqlerror exit failure
+          set heading off feedback off pagesize 0
+          select 'users='  || count(*) from dba_users where username = 'CITEST1';
+          select 'table='  || count(*) from user_tables where table_name = 'T_BACKUP_DATA';
+          select 'rows='   || count(*) from t_backup_data;
+          select 'values=' || listagg(val, ',') within group (order by val) from t_backup_data;
+          exit
+          SQL
+          grep -qx 'users=1'                       restore.out
+          grep -qx 'table=1'                       restore.out
+          grep -qx 'rows=3'                        restore.out
+          grep -qx 'values=row-one,row-three,row-two' restore.out
+
+          sql -S -name "$DB_CONN_NAME" <<'SQL' | sed 's/[[:space:]]*$//' | tee restore_ws.out
+          whenever sqlerror exit failure
+          set heading off feedback off pagesize 0
+          select 'ws=' || count(*) from apex_workspaces where workspace = 'CITEST1';
+          exit
+          SQL
+          grep -qx 'ws=1' restore_ws.out
+
+      - name: Test create-user.sh --compress
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./scripts/util/load_env.sh
+
+          # --compress sets Advanced Compression defaults on the new schema's
+          # tablespace so future segments are born compressed. Assert BOTH the
+          # table and index defaults are set: they must be applied in a single
+          # ALTER TABLESPACE (a separate index ALTER silently resets the table
+          # default back to NOCOMPRESS).
+          ./scripts/create-user.sh CMPDEF --skip-workspace --compress
+
+          sql -S -name "$DB_CONN_NAME" <<'SQL' | sed 's/[[:space:]]*$//' | tee compress_defaults.out
+          whenever sqlerror exit failure
+          set heading off feedback off pagesize 0
+          select 'def_tab=' || def_tab_compression  from dba_tablespaces where tablespace_name = 'TBS_CMPDEF';
+          select 'def_idx=' || def_index_compression from dba_tablespaces where tablespace_name = 'TBS_CMPDEF';
+          exit
+          SQL
+          grep -qx 'def_tab=ENABLED' compress_defaults.out
+          grep -qx 'def_idx=ENABLED' compress_defaults.out
+
+      - name: Test compress-space.sh
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./scripts/util/load_env.sh
+
+          # Create an uncompressed schema with data, then compress it in place. A
+          # multi-column index is used on purpose: advanced index compression
+          # skips single-column unique keys (nothing to dedup).
+          ./scripts/create-user.sh CMPOLD --skip-workspace
+
+          sql -S -name "${DB_CONN_BASE}-cmpold" <<'SQL'
+          whenever sqlerror exit failure
+          create table t_comp (id number, grp varchar2(20), txt varchar2(200));
+          create index t_comp_ix on t_comp (grp, id);
+          insert into t_comp
+            select level, 'g' || mod(level, 5), rpad('x', 200, 'x')
+              from dual connect by level <= 5000;
+          commit;
+          exit
+          SQL
+
+          ./scripts/compress-space.sh CMPOLD -y
+
+          sql -S -name "$DB_CONN_NAME" <<'SQL' | sed 's/[[:space:]]*$//' | tee compress_space.out
+          whenever sqlerror exit failure
+          set heading off feedback off pagesize 0
+          -- existing table + multi-column index were rebuilt compressed
+          select 'tab=' || compress_for from dba_tables  where owner = 'CMPOLD' and table_name = 'T_COMP';
+          select 'idx=' || compression  from dba_indexes where owner = 'CMPOLD' and index_name = 'T_COMP_IX';
+          -- and the tablespace defaults were set for future segments
+          select 'def_tab=' || def_tab_compression  from dba_tablespaces where tablespace_name = 'TBS_CMPOLD';
+          select 'def_idx=' || def_index_compression from dba_tablespaces where tablespace_name = 'TBS_CMPOLD';
+          exit
+          SQL
+          grep -qx 'tab=ADVANCED'     compress_space.out
+          grep -qx 'idx=ADVANCED LOW' compress_space.out
+          grep -qx 'def_tab=ENABLED'  compress_space.out
+          grep -qx 'def_idx=ENABLED'  compress_space.out
+
+      - name: Test cap-tablespaces.sh and the space defaults
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./scripts/util/load_env.sh
+
+          # A fresh install must already be fully capped by after-first-db-start.sh
+          # and create-user.sh. If any of these fail, an uncapped datafile shipped:
+          # one runaway file can then push the PDB past the 12 GB Free-edition
+          # limit, and a PDB over that limit does not open in ANY mode and cannot
+          # be repaired from inside.
+          ./scripts/cap-tablespaces.sh --summary | tee caps.out
+          grep -qx 'uncapped_files=0'            caps.out
+          grep -qx 'pending_files=0'             caps.out
+          grep -qx 'undo_max_mb=2048'            caps.out
+          grep -qx 'undo_retention=900'          caps.out
+          grep -qx 'undo_guarantee=NOGUARANTEE'  caps.out
+          grep -qx 'audit_max_mb=1024'           caps.out
+          grep -qx 'audit_purge_job=present'     caps.out
+
+          # --check must stay read-only, and re-running --apply must be a no-op.
+          ./scripts/cap-tablespaces.sh --check >/dev/null
+          ./scripts/cap-tablespaces.sh --apply -y | tee caps_apply.out
+          grep -q 'changed 0 datafile ceiling' caps_apply.out
+          ./scripts/cap-tablespaces.sh --summary | grep -qx 'pending_files=0'
+
+          # used-space must report OK on a fresh install, and must report through
+          # the exit code. 0 = OK, 10 = WARNING, 11 = CRITICAL.
+          ./scripts/used-space.sh --summary | tee space.out
+          grep -qx 'status=OK' space.out
+          ./scripts/used-space.sh --quiet
+
+          # Lowering the threshold below the current usage must flip the verdict,
+          # which proves the exit-code contract is wired up and not just printed.
+          rc=0
+          SPACE_CRIT_GB=0.1 ./scripts/used-space.sh --quiet || rc=$?
+          test "$rc" = "11"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          mkdir -p artifacts
+          # load_env.sh calls `exit` if .env is missing (e.g. install failed
+          # early), which would abort this step — only source it when present.
+          if [ -f .env ]; then
+            # shellcheck disable=SC1091
+            source ./scripts/util/load_env.sh
+          fi
+          : "${DOCKER_COMPOSE:=${CONTAINER_CLI:-docker} compose}"
+          $DOCKER_COMPOSE logs --no-color 26ai     > artifacts/db.log   2>&1 || true
+          $DOCKER_COMPOSE logs --no-color ords-26ai > artifacts/ords.log 2>&1 || true
+          $DOCKER_COMPOSE ps > artifacts/ps.txt 2>&1 || true
+          $DOCKER_COMPOSE config > artifacts/compose-resolved.yml 2>&1 || true
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs
+          path: artifacts/
+          if-no-files-found: ignore

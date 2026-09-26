@@ -1,0 +1,104 @@
+---
+title: Oracle APEX Local Development Environment - Containerized Setup
+description: Containerized Oracle APEX development environment with 26ai database and ORDS. Works with Docker, Podman, or any container runtime. Set up local APEX development in minutes with automated workspace management, backups, and testing tools.
+sidebar:
+  order: 10
+template: doc
+hero:
+  tagline: Set up Oracle APEX local development in minutes. A containerized environment that makes building and testing APEX applications on your machine effortless.
+  actions:
+    - text: Get Started
+      link: /products/uc-local-apex-dev/docs/getting-started/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/United-Codes/uc-local-apex-dev
+      icon: external
+      variant: minimal
+---
+
+uc-local-apex-dev is a containerized Oracle APEX development environment. It **automates the tedious parts** of a local environment. It works with Docker, Podman, and any other container runtime.
+
+You get a complete Oracle 26ai database with APEX and ORDS on your machine, with SSL. You also get bash scripts for the daily tasks. Each task is one command: create a workspace, run a backup, clear a schema, or test a script or an APEX application.
+
+## Key Features
+
+import { Card, CardGrid } from "@astrojs/starlight/components";
+
+<CardGrid>
+  <Card title="Quick Setup" icon="rocket">
+    Get Oracle 26ai with APEX 24.2+ and ORDS running in minutes using any
+    container runtime (Docker, Podman, etc.) with automated setup scripts.
+
+    [Installation guide →](/products/uc-local-apex-dev/docs/getting-started/)
+  </Card>
+  <Card title="Oracle 26ai" icon="seti:db">
+    Run the latest Oracle Database 26ai Free with all features enabled and
+    pre-configured for development.
+
+    [Get started →](/products/uc-local-apex-dev/docs/getting-started/)
+  </Card>
+  <Card title="One-Command Operations" icon="laptop">
+    Simple wrapper script (local-26ai.sh) turns complex tasks into single
+    commands: create users, backup workspaces, clear schemas, test installs.
+
+    [See all commands →](/products/uc-local-apex-dev/docs/reference/commands/)
+  </Card>
+  <Card title="Automated User Management" icon="add-document">
+    Create users and workspaces with optimal development grants using a single
+    command. Users are automatically registered in SQLcl and VS Code for instant
+    access.
+
+    [Creating users →](/products/uc-local-apex-dev/docs/getting-started/creating-users/)
+  </Card>
+  <Card title="Backup & Restore" icon="cloud-download">
+    Built-in Oracle DataPump integration for easy backup and restore of schemas,
+    workspaces, and applications with a single command.
+
+    [Backups guide →](/products/uc-local-apex-dev/docs/getting-started/backups/)
+  </Card>
+  <Card title="Installation Testing" icon="approve-check">
+    Test APEX application installs and SQL scripts repeatedly in isolated test
+    users. Automatically validates dependencies and installation success.
+
+    [Install apps or scripts →](/products/uc-local-apex-dev/docs/getting-started/install-apps-scripts/)
+  </Card>
+  <Card title="HTTPS/SSL Ready" icon="approve-check-circle">
+    ORDS runs with SSL support using self-signed certificates for secure local
+    development matching production environments.
+
+    [SSL configuration →](/products/uc-local-apex-dev/docs/getting-started/common-tasks/#ssl-configuration)
+  </Card>
+  <Card title="PL/SQL Debugging" icon="seti:config">
+    Pre-configured with all necessary grants and settings for VS Code SQL
+    Developer debugger and SQLcl development.
+
+    [Debugging guide →](/products/uc-local-apex-dev/docs/getting-started/plsql-debugging/)
+  </Card>
+</CardGrid>
+
+## Perfect for Local APEX Development
+
+This environment is for Oracle APEX developers who need a local development database. You can do the following with it:
+
+- **Develop Locally**: Work on APEX applications without a remote database, a cloud instance, or apex.oracle.com
+- **Test Installation Scripts**: Clear a schema and install an APEX application again, as many times as you need
+- **Rapid Prototyping**: Create a new workspace and a test schema in one command
+- **Debug PL/SQL Code**: Use the VS Code SQL Developer debugger. The scripts add all necessary grants
+- **Manage Workspaces**: Create and manage many APEX workspaces and database schemas
+- **SSL**: Run ORDS with SSL, the same as in production. This prevents protocol mismatch errors
+- **Automated Backups**: One script exports all your schemas, APEX workspaces, applications, and ORDS modules
+- **Safe Testing Environment**: Try new APEX features without a risk to production or to a shared development database
+
+## What's Included
+
+- **Oracle Database 26ai Free**: Latest Oracle database with all development features
+- **Latest Oracle APEX**: Full APEX installation with admin access
+- **Oracle ORDS with SSL**: REST Data Services pre-configured with self-signed certificates
+- **Automated Scripts**: More than 20 bash scripts for common development tasks, through one wrapper
+- **Development Grants**: All necessary permissions for debugging, DataPump, and workspace management
+- **SQLcl Integration**: Every new user is in the connection store of SQLcl
+- **VS Code Integration**: Every new user is in the VS Code SQL Developer extension, with PL/SQL debugging
+
+## Important Note
+
+⚠️ **Do not use this environment in production.** It is insecure by design. It stores the passwords in plain text and relaxes all security features. Run backups regularly.

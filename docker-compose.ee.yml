@@ -1,0 +1,31 @@
+# Enterprise Edition overlay for docker-compose.yml.
+#
+# setup.sh activates it when DB_EDITION=ee by writing
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.ee.yml
+# into .env. `docker compose` reads COMPOSE_FILE from .env, so every compose
+# call (install.sh, start, stop, logs) merges this file on top of the base one.
+# The base docker-compose.yml stays untouched, so upstream updates merge cleanly.
+#
+# The image is built locally by `./local-26ai.sh build-ee-image` from the
+# Oracle AI Database 26ai Enterprise Edition install ZIP. It is never pulled.
+services:
+  26ai:
+    image: ${DB_IMAGE:?DB_IMAGE is not set in .env - run setup with DB_EDITION=ee}
+    pull_policy: never
+    # Oracle uses /dev/shm for parallel query and some memory structures. The
+    # Docker default of 64 MB is too small for a real SGA.
+    shm_size: ${DB_SHM_SIZE:-2gb}
+    environment:
+      ORACLE_SID: ${ORACLE_SID:-ORCLCDB}
+      # First PDB. DBCA creates it with the CDB. More PDBs come from create-pdb.
+      ORACLE_PDB: ${ORACLE_PDB:-DEVPDB}
+      ORACLE_EDITION: enterprise
+      # Both or neither: the image refuses to start with only one of them.
+      INIT_SGA_SIZE: ${INIT_SGA_SIZE:-4096}
+      INIT_PGA_SIZE: ${INIT_PGA_SIZE:-1024}
+      ENABLE_ARCHIVELOG: ${ENABLE_ARCHIVELOG:-true}
+    healthcheck:
+      # The first boot runs DBCA and takes 20 to 60 minutes on EE. install.sh
+      # waits on the log banner, not on this status, so this only keeps
+      # `docker ps` from showing "unhealthy" during the first creation.
+      start_period: 60m

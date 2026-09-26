@@ -1,0 +1,19 @@
+.DS_Store
+backups
+oradata_old
+ords-config
+ords-secrets
+.env
+.env.bak
+.env_old
+.env.ords
+**/cert.crt
+**/key.key
+apex/**/*
+META-INF/**/*
+apex-images
+install_*.log
+.fetch-client/
+# Enterprise Edition: install ZIP and the oracle/docker-images build checkout
+ee-install/*.zip
+.build

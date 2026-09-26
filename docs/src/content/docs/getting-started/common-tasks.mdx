@@ -1,0 +1,270 @@
+---
+title: Common Tasks
+description: Learn how to perform common development tasks with UC Local APEX Dev
+sidebar:
+  order: 2
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+After you install the environment, these are the most common tasks in APEX development.
+
+<Aside type="note" title="Docker or Podman">
+The commands on this page that call `docker compose` also work with Podman. Replace `docker compose` with `podman compose`. The scripts of this project (`local-26ai.sh`, `./scripts/*.sh`) detect the engine, so you change nothing for those.
+</Aside>
+
+## Managing Containers
+
+### Start/Stop Containers
+
+```bash
+# Stop database
+local-26ai.sh stop
+# You could also run this, but the script will gracefully stop the database
+# docker compose stop   (or: podman compose stop)
+
+local-26ai.sh start
+# Or
+# docker compose start  (or: podman compose start)
+```
+
+## ORDS Configuration
+
+### Modify ORDS Settings
+
+The `ords-config` folder in the root directory contains the configuration files of ORDS. Change these files. Then restart the ORDS container:
+
+```bash
+# After modifying config files
+docker compose restart ords-26ai   # or: podman compose restart ords-26ai
+```
+
+### SSL Configuration
+
+To enable HTTPS for ORDS, create self-signed certificates. On macOS and Linux the script also adds the certificate to the keychain of your system:
+
+```bash
+sudo ./scripts/create-self-signed-certificates.sh
+docker compose restart ords-26ai   # or: podman compose restart ords-26ai
+```
+
+Then open https://localhost:8443/ords. ORDS uses port 8443 for HTTPS, not port 8181.
+
+## Maintenance Tasks
+
+### Check Database Space Usage
+
+The Free edition of the database has a space limit of 12GB. Show the used space with this command:
+
+```bash
+local-26ai.sh used-space
+
+#    CURRENT_GB    LIMIT_GB    PERCENT_OF_LIMIT STATUS
+# _____________ ___________ ___________________ _________
+#          5.04          12               41.97 OK
+
+
+# Tablespace                 Total MB    Used MB    Free MB    Pct. Free
+# _______________________ ___________ __________ __________ ____________
+# SYSAUX                         3440       3158        282            8
+# SYSTEM                          690        679         11            2
+# USERS                           118         59         59           50
+# TBS_PLUGINS                     112         38         74           66
+# UNDOTBS1                        103         23         80           78
+# TBS_AOP                          77          7         70           91
+```
+
+The `STATUS` column shows `WARNING` above 9.5GB and `CRITICAL` above 11GB. The
+command also gives the same answer as an exit code, so a script can use it:
+
+| Exit code | Meaning |
+| --------- | ------- |
+| `0` | The used space is below the warning threshold. |
+| `1` | The command failed. For example, it cannot reach the database. |
+| `10` | `WARNING`. The used space is at or above `SPACE_WARN_GB`. |
+| `11` | `CRITICAL`. The used space is at or above `SPACE_CRIT_GB`. |
+
+For a script, use `--summary` for `key=value` lines, or `--quiet` for the exit
+code alone:
+
+```bash
+local-26ai.sh used-space --summary
+
+# current_gb=9.94
+# limit_gb=12
+# pct_of_limit=82.8
+# warn_gb=9.5
+# crit_gb=11
+# status=WARNING
+```
+
+To change the two thresholds, set `SPACE_WARN_GB` and `SPACE_CRIT_GB` in your
+`.env` file. The warning threshold is below the limit on purpose. Every way to
+make a full database smaller needs free space to work in.
+
+The `stop` command runs the same check before it shuts the database down. This is
+the last point at which you can act, because a database that is above the limit
+does not open again.
+
+### Limit the Size of the Datafiles
+
+A datafile with no ceiling can grow until the PDB passes the 12GB limit. The PDB
+then does not open, and you cannot correct it from inside. On one real install the
+undo datafile grew to 3810MB and passed the limit alone. See
+[the recovery steps](/products/uc-local-apex-dev/docs/other/faq/#the-database-does-not-start-and-the-log-shows-ora-12954-what-do-i-do)
+if this already happened to you.
+
+Show the datafiles that have no ceiling:
+
+```bash
+local-26ai.sh cap-tablespaces --check
+```
+
+Give them a ceiling:
+
+```bash
+local-26ai.sh cap-tablespaces --apply
+```
+
+The command sets `MAXSIZE` on each datafile. It never drops an object and it never
+moves data. You can run it again safely, because it skips every datafile that
+already has the correct ceiling. A ceiling that is tighter than the default stays
+as it is.
+
+New installs get these ceilings when the tablespace is created. Run this command
+one time on a database that you created with version 26.3 or earlier.
+
+<Aside type="note">
+A ceiling is not a reservation. The ceilings add up to more than 12GB, and they do
+not keep the total below the limit. A ceiling makes sure that one datafile cannot
+take all the free space without notice. The one schema gets `ORA-01653`, the
+database stays open, and every other schema continues to work.
+</Aside>
+
+`SYSTEM` and `SYSAUX` never get a ceiling. A full `SYSTEM` tablespace is a worse
+failure than the disk space that a ceiling saves. Both tablespaces grow slowly.
+
+If a datafile is already larger than its ceiling, the command uses the current
+size of the file. Run `shrink-space` and then run the command again. The second
+run lowers the ceiling to the default:
+
+```bash
+local-26ai.sh shrink-space
+local-26ai.sh cap-tablespaces --apply
+```
+
+To change the ceiling for new schemas, set `USER_TBS_MAXSIZE` in your `.env` file.
+The default is `2G`.
+
+### Shrink Database Files
+
+If the tablespaces are larger than the space that they use, shrink them. This command can run for several minutes.
+
+```bash
+local-26ai.sh shrink-space
+```
+
+### Compress a Schema's Tablespace
+
+`shrink-space` reclaims *unused* space only. `compress-space` makes the data itself smaller.
+
+The command enables [Advanced Compression](https://www.oracle.com/database/advanced-compression/) on the `tbs_<schema>` tablespace of one schema. Oracle Database Free includes this feature. The command then rebuilds the objects in that tablespace in compressed form:
+
+- Tables get advanced row compression (`COMPRESS FOR OLTP`). The database compresses them again when rows change.
+- B-tree indexes get advanced index compression (`COMPRESS ADVANCED LOW`).
+- New segments also use compression, because the command sets the tablespace defaults.
+
+After the rebuild, the command runs `dbms_space.shrink_tablespace` and makes the datafile smaller. The operating system gets the free space in the same run.
+
+```bash
+local-26ai.sh compress-space movies
+# Skip the confirmation prompt with -y:
+local-26ai.sh compress-space movies -y
+
+# Tablespace usage before compression:
+#    USED_MB    ALLOCATED_MB
+# __________ _______________
+#     1000.8            2100
+# ...
+# Tablespace usage after compression:
+#    USED_MB    ALLOCATED_MB
+# __________ _______________
+#      595.6           749.7
+```
+
+<Aside type="note">
+The command runs online and never drops an object. You can run it again safely, because it skips the objects that are already compressed. It does not compress a unique index or a primary-key index with one column. Advanced index compression cannot remove duplicate values from these indexes.
+</Aside>
+
+### Disable Archive Logs
+
+Archive logging is not necessary in a development environment. The `after-first-db-start.sh` script asks you about this setting. You can also run the script for it directly:
+
+```bash
+./scripts/disable-archive-logs.sh
+```
+
+### Manage APEX Account Expiration
+
+#### Unexpire Accounts
+
+If the APEX_PUBLIC_USER account or a workspace account is locked because the password expired, unlock it with this command:
+
+```bash
+./scripts/unexpire-accounts.sh
+```
+
+Run this script after a database migration, or when an account expires after some time.
+
+#### Disable Password Expiration
+
+`install.sh` already runs this script, so a new installation needs it only after a
+change to the password profile. Run it so the passwords of APEX workspace accounts
+never expire:
+
+```bash
+./scripts/disable-password-expiration.sh
+```
+
+<Aside type="note">
+  Users can still get a prompt to change the password at the first login after a
+  migration. This happens even when password expiration is disabled.
+</Aside>
+
+## Workspace Import/Export
+
+### Import All Exports
+
+Import every export file from the `./backups/import/` directory:
+
+```bash
+./scripts/import-all.sh
+```
+
+Use this script during a database migration, when you import many workspaces and schemas at the same time. The script shows a summary of the successful and the failed imports.
+
+### Fix Workspace Export Issues
+
+A [known bug with group assignments](https://forums.oracle.com/ords/apexds/post/apex-18-2-failing-to-import-workspace-5048) can make the import of an APEX workspace fail. If this happens, run this script:
+
+```bash
+./scripts/fix-ws-group-ids.sh
+```
+
+The script deletes the group ID parameters from every export file in `./backups/import/`. Then the files import correctly.
+
+## Complete Environment Reset
+
+### Delete All Data
+
+⚠️ **CAUTION: These commands delete the database volume.** All schemas, workspaces, and applications are lost. Run `local-26ai.sh backup-all` first.
+
+To start again with an empty database, run these commands:
+
+```bash
+docker compose down        # or: podman compose down
+docker volume rm oradata-26ai   # or: podman volume rm oradata-26ai
+rm .env
+```
+
+Then do the [setup](/products/uc-local-apex-dev/docs/getting-started/) again.

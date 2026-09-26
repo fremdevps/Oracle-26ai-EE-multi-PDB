@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# desc: Create a DB schema + APEX workspace with dev grants (--skip-workspace, --compress)
+
+set -e
+
+source ./scripts/util/load_env.sh
+source ./scripts/util/generate_password.sh
+source ./scripts/util/get_ws_settings.sh
+source ./scripts/util/user_in_env.sh
+source ./scripts/util/user-exists-in-db.sh
+
+skip_workspace=false
+compress=false
+
+usage() {
+  echo "Usage: $0 <schema_name> [--skip-workspace] [--compress]"
+  exit 1
+}
+
+# check parameter is passed
+if [ -z "$1" ]; then
+  usage
+fi
+USERNAME=$1
+
+# check if username contains hyphen
+if [[ "$USERNAME" == *"-"* ]]; then
+  echo "Error: Username cannot contain hyphens (-). Oracle identifiers do not support hyphens."
+  exit 1
+fi
+shift # Remove schema_name from argument list
+
+# Process remaining arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --skip-workspace)
+    skip_workspace=true
+    shift
+    ;;
+  --compress)
+    compress=true
+    shift
+    ;;
+  *)
+    echo "Error: Unknown parameter '$1'"
+    usage
+    ;;
+  esac
+done
+
+USERNAME_UPPER=$(echo "$USERNAME" | tr '[:lower:]' '[:upper:]')
+USERNAME_LOWER=$(echo "$USERNAME" | tr '[:upper:]' '[:lower:]')
+
+# Decide the APEX workspace login password. By default new workspaces use the
+# well-known shared dev password 'Welcome_1'. Set WORKSPACE_USE_INTERNAL_PASSWORD=true
+# in .env to instead reuse the (randomly generated) INTERNAL ADMIN password, i.e.
+# ORACLE_PASSWORD, which is what the APEX Internal workspace ADMIN also uses.
+# A secure install (SECURE_MODE=true, set by `install.sh --secure`) implies this.
+if [ "${WORKSPACE_USE_INTERNAL_PASSWORD:-false}" = "true" ] || [ "${SECURE_MODE:-false}" = "true" ]; then
+  if [ -z "${ORACLE_PASSWORD:-}" ]; then
+    echo "Error: WORKSPACE_USE_INTERNAL_PASSWORD=true but ORACLE_PASSWORD is not set in .env"
+    exit 1
+  fi
+  WS_PASSWORD=$ORACLE_PASSWORD
+  WS_PASSWORD_LABEL="the INTERNAL ADMIN password (ORACLE_PASSWORD from .env)"
+else
+  WS_PASSWORD="Welcome_1"
+  WS_PASSWORD_LABEL="Welcome_1"
+fi
+
+# When --compress is given, set Advanced Compression defaults on the new
+# tablespace so every segment created in it is born compressed (advanced row
+# compression for tables, advanced index compression for B-tree indexes). The
+# schema is empty at this point, so only the defaults are needed -- no rebuild.
+# Use compress-space.sh to apply the same to a schema that already has data.
+#
+# Both the TABLE and INDEX clauses MUST be set in a single ALTER: each
+# ALTER TABLESPACE ... DEFAULT replaces the whole default spec, so a separate
+# index-only ALTER would silently reset the table default back to NOCOMPRESS.
+COMPRESS_DEFAULTS=""
+if [ "$compress" = true ]; then
+  COMPRESS_DEFAULTS="
+  alter tablespace tbs_${USERNAME_LOWER} default table compress for oltp index compress advanced low;
+"
+fi
+
+# Ceiling for the new tablespace. The Free edition allows 12 GB of datafiles per
+# PDB, and a PDB that goes over the limit will not open again in ANY mode --
+# ORA-12954 is raised before the open, so it cannot be repaired from inside.
+#
+# This is a ceiling, not a reservation. It does not keep the total under 12 GB
+# (use `local-26ai.sh used-space` for that). What it guarantees is that one
+# runaway schema cannot silently absorb all the remaining headroom: it hits
+# ORA-01653 on its own tablespace instead, and every other schema keeps working.
+#
+# Note that `grant unlimited tablespace` below makes a per-user quota
+# unenforceable, so this maxsize is the only working per-schema limit.
+USER_TBS_MAXSIZE="${USER_TBS_MAXSIZE:-2G}"
+
+# if user exists in .env file
+if user_in_env_bool "$USERNAME"; then
+
+  if user_exists_in_db "$USERNAME"; then
+    echo "User $USERNAME already exists in the database"
+    exit 0
+  fi
+
+  ENV_VAR=${USERNAME_UPPER}_USER_PASSWORD
+
+  if [ -z "${!ENV_VAR}" ]; then
+    echo "Error: User is listed in env but ${ENV_VAR} is empty"
+    exit 1
+  fi
+
+  USER_PASSWORD=${!ENV_VAR}
+else
+  # generate password and save to .env file
+  USER_PASSWORD=$(generate_password)
+  echo "${USERNAME_UPPER}_USER_PASSWORD=\"$USER_PASSWORD\"" >>.env
+fi
+
+sql -name "$DB_CONN_NAME" <<SQL
+  select user from dual;
+
+  create tablespace tbs_${USERNAME_LOWER}
+    datafile 'tbs_${USERNAME_LOWER}.dat'
+      size 10M
+      reuse
+      autoextend on next 2M
+      maxsize ${USER_TBS_MAXSIZE};
+${COMPRESS_DEFAULTS}
+  create user ${USERNAME}
+    identified by "${USER_PASSWORD}"
+    default tablespace tbs_${USERNAME_LOWER}
+  ;
+
+  grant db_developer_role to ${USERNAME};
+  grant create session to ${USERNAME};
+  grant create table to ${USERNAME};
+  grant create view to ${USERNAME};
+  grant create any trigger to ${USERNAME};
+  grant create any procedure to ${USERNAME};
+  grant create sequence to ${USERNAME};
+  grant create synonym to ${USERNAME};
+  grant unlimited tablespace to ${USERNAME};
+
+  -- also recommended when with apex workspace
+  grant create cluster to ${USERNAME};
+  grant create dimension to ${USERNAME};
+  grant create indextype to ${USERNAME};
+  grant create job to ${USERNAME};
+  grant create materialized view to ${USERNAME};
+  grant create operator to ${USERNAME};
+  grant create procedure to ${USERNAME};
+  grant create trigger to ${USERNAME};
+  grant create type to ${USERNAME};
+  grant create any context to ${USERNAME};
+  grant create mle to ${USERNAME};
+  grant create property graph to ${USERNAME};
+  grant create assertion to ${USERNAME};
+  grant execute dynamic mle to ${USERNAME};
+
+  grant execute on dbms_crypto to ${USERNAME};
+  grant execute on dbms_lock   to ${USERNAME};
+  grant execute on dbms_lob    to ${USERNAME};
+  grant execute on dbms_xmlgen to ${USERNAME};
+  grant execute on dbms_sql    to ${USERNAME};
+  grant execute on dbms_random to ${USERNAME};
+  grant execute on dbms_aqadm to ${USERNAME};
+  grant execute on dbms_aq to ${USERNAME};
+  grant execute on javascript to ${USERNAME};
+  grant aq_administrator_role to ${USERNAME};
+  grant select_catalog_role to ${USERNAME};
+
+  grant debug connect session to ${USERNAME};
+  grant debug connect any to ${USERNAME};
+  grant debug any procedure to ${USERNAME};
+
+  grant read, write on directory datapump_import_dir to ${USERNAME};
+  grant read, write on directory datapump_export_dir to ${USERNAME};
+
+
+  -- allow debug
+  begin
+  DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+    host => '*',
+    ace  =>  xs\$ace_type(privilege_list => xs\$name_list('jdwp'),
+                         principal_name => '${USERNAME}',
+                         principal_type => xs_acl.ptype_db));
+  end;
+  /
+
+  exit;
+SQL
+
+echo ">>>>"
+echo "created user"
+
+if [ "$skip_workspace" = true ]; then
+  echo ">>>>"
+  echo "skipped workspace creation"
+else
+  # get workspace settings (extended session timeout, etc)
+  WS_SETTINGS=$(get_ws_settings "$USERNAME")
+
+  sql -name "$DB_CONN_NAME" <<SQL
+    select user from dual;
+
+    BEGIN
+      apex_instance_admin.add_workspace (
+        p_workspace      => '${USERNAME}',
+        p_primary_schema => '${USERNAME}' 
+      );
+
+      commit;
+
+      $WS_SETTINGS
+
+      apex_util.set_workspace( p_workspace => '${USERNAME}');
+
+      commit;
+
+      APEX_UTIL.CREATE_USER(
+        p_user_name                    => '${USERNAME}',
+        p_web_password                 => '${WS_PASSWORD}',
+        p_email_address                => '${USERNAME}@localhost.com',
+        p_developer_privs              => 'ADMIN:CREATE:DATA_LOADER:EDIT:HELP:MONITOR:SQL',
+        p_change_password_on_first_use => 'N',
+        p_default_schema               => '${USERNAME}'
+      );
+
+      commit;
+
+      APEX_UTIL.CREATE_USER(
+        p_user_name                    => 'ADMIN',
+        p_web_password                 => '${WS_PASSWORD}',
+        p_email_address                => 'admin@localhost.com',
+        p_developer_privs              => 'ADMIN:CREATE:DATA_LOADER:EDIT:HELP:MONITOR:SQL',
+        p_change_password_on_first_use => 'N',
+        p_default_schema               => '${USERNAME}'
+      );
+
+      commit;
+
+      for c1 in (select user_name from apex_workspace_apex_users) loop
+        begin
+          apex_util.unexpire_workspace_account(p_user_name => c1.user_name);
+        exception
+          when others then
+            null;
+        end;
+      end loop;
+
+      commit;
+    END;
+    /
+
+    exit;
+SQL
+
+  echo ">>>>"
+  echo "created workspace. Access with username 'ADMIN' or ${USERNAME} and password ${WS_PASSWORD_LABEL}"
+  echo "http://localhost:8181${ORDS_PATH:-/ords}/r/apex/workspace-sign-in/oracle-apex-sign-in"
+fi
+
+USER_DB_CONN_NAME="${DB_CONN_BASE}-${USERNAME_LOWER}"
+
+sql "${USERNAME_LOWER}"/"${USER_PASSWORD}"@localhost:${DBPORT:-1521}/${DBSERVICENAME:-FREEPDB1} <<SQL
+  select user from dual;
+
+  conn -save ${USER_DB_CONN_NAME} -savepwd -replace
+
+  begin
+    ords.enable_schema;
+  end;
+  /
+
+  exit;
+SQL
+
+echo ">>>>"
+echo "saved sqlcl connection"
+echo "connect with 'sql -name $USER_DB_CONN_NAME'"
