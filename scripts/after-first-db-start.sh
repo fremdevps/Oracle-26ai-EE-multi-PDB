@@ -36,6 +36,20 @@ fi
 source ./scripts/util/load_env.sh
 source ./scripts/util/get_ws_settings.sh
 
+# Datafile names. Free has one PDB, so fixed names are fine there. On Enterprise
+# Edition every PDB runs this script, and a fixed relative name lands in
+# $ORACLE_HOME/dbs: the second PDB fails with "file exists", and the file lives in
+# the container layer instead of the oradata volume. EE uses Oracle Managed Files
+# (db_create_file_dest is set by DBCA), so leave the name out and Oracle creates a
+# unique file per PDB under /opt/oracle/oradata.
+if [ "${DB_EDITION:-free}" = "ee" ]; then
+  AUDIT_DATAFILE=""
+  APEX_DATAFILE=""
+else
+  AUDIT_DATAFILE="'audit01.dbf'"
+  APEX_DATAFILE="'tbs_apex.dbf'"
+fi
+
 # save sys connection
 ./scripts/util/save-sqlcl-connection.sh
 
@@ -62,7 +76,7 @@ sql -name "$DB_CONN_NAME" <<SQL
 set serveroutput on size unlimited
 
 create tablespace audit_trail
-  datafile 'audit01.dbf'
+  datafile ${AUDIT_DATAFILE}
   size 20m
   autoextend on next 8m
   maxsize 1g;
@@ -151,7 +165,7 @@ end;
 /
 
 create bigfile tablespace tbs_apex
-  datafile 'tbs_apex.dbf'
+  datafile ${APEX_DATAFILE}
   size 20m
   autoextend on next 20m
   maxsize ${APEX_TBS_MAXSIZE:-3g}

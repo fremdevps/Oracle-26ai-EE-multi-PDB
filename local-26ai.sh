@@ -37,7 +37,7 @@ print_help() {
   for cmd in after-first-db-start upgrade-apex repair-ru-dictionary unexpire-accounts disable-password-expiration disable-archive-logs create-self-signed-certificates install-dbms-cloud; do print_command "$cmd"; done
   echo
   echo "Enterprise Edition:"
-  for cmd in build-ee-image create-pdb; do print_command "$cmd"; done
+  for cmd in build-ee-image create-pdb move-datafiles-omf; do print_command "$cmd"; done
   echo
   echo "Docs: https://www.united-codes.com/products/uc-local-apex-dev/docs/"
 }

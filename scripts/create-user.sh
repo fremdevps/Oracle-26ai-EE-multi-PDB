@@ -119,13 +119,19 @@ else
   echo "${USERNAME_UPPER}_USER_PASSWORD=\"$USER_PASSWORD\"" >>.env
 fi
 
+# Enterprise Edition: Oracle Managed Files, one unique file per PDB in the
+# oradata volume (see after-first-db-start.sh). Free keeps the fixed name.
+if [ "${DB_EDITION:-free}" = "ee" ]; then
+  USER_DATAFILE_CLAUSE="size 10M"
+else
+  USER_DATAFILE_CLAUSE="'tbs_${USERNAME_LOWER}.dat' size 10M reuse"
+fi
+
 sql -name "$DB_CONN_NAME" <<SQL
   select user from dual;
 
   create tablespace tbs_${USERNAME_LOWER}
-    datafile 'tbs_${USERNAME_LOWER}.dat'
-      size 10M
-      reuse
+    datafile ${USER_DATAFILE_CLAUSE}
       autoextend on next 2M
       maxsize ${USER_TBS_MAXSIZE};
 ${COMPRESS_DEFAULTS}
